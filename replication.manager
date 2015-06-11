@@ -1,0 +1,612 @@
+#!/bin/bash
+
+# Msingh 31/03/15
+
+# In the ansible hosts /etc/ansible/hosts
+# [master]
+# mdns-master-db
+#
+# [slaves]
+# mdns-slave-db
+# mdns-slave-db-1
+#
+# For each slave in /etc/ansible/facts.d/mysql.fact on master
+#
+# [nameserver]
+# master_host=10.0.1.1
+# slave_host=10.0.1.11
+# master_user=replication
+# master_password=password
+# master_ssl_ca=/etc/mysql/certs/ca-cert.pem
+# master_ssl_cert=/etc/mysql/certs/client-cert.pem
+# master_ssl_keys/etc/mysql/certs/client-key.pem
+
+# For each slave in /etc/ansible/facts.d/mysqllogin.fact on master
+# [nameserver]
+# mysqlusername=rootuser
+# mysqlpassword=rootpassword
+#
+# Requires Ansible and MySQL-python on master and slaves along with SSH key setup
+
+IFS=!
+
+programs=( "dialog" "echo" "cat" "logger" "ps" "ansible" "id" "grep" "pidof" "mktemp" "rm" "awk" "kill" "pkill" )
+# we send notification emails here
+ADDR="noc@test.com"
+ANSIBLE_CONFIG="/etc/ansible/hosts"
+
+#set -e
+
+declare -a sargs=()
+
+export black='\033[0m'
+export boldblack='\033[1;0m'
+export red='\033[31m'
+export boldred='\033[1;31m'
+export green='\033[32m'
+export boldgreen='\033[1;32m'
+export yellow='\033[33m'
+export boldyellow='\033[1;33m'
+export blue='\033[34m'
+export boldblue='\033[1;34m'
+export magenta='\033[35m'
+export boldmagenta='\033[1;35m'
+export cyan='\033[36m'
+export boldcyan='\033[1;36m'
+export white='\033[37m'
+export boldwhite='\033[1;37m'
+
+function cecho ()
+
+## -- Function to easliy print colored text -- ##
+
+        # Color-echo.
+        # Argument $1 = message
+        # Argument $2 = color
+{
+local default_msg="No message passed."
+# Doesn't really need to be a local variable.
+
+message=${1:-$default_msg}      # Defaults to default message.
+
+#change it for fun
+#We use pure names
+color=${2:-black}               # Defaults to black, if not specified.
+
+case $color in
+        black)
+                 printf "$black" ;;
+        boldblack)
+                 printf "$boldblack" ;;
+        red)
+                 printf "$red" ;;
+        boldred)
+                 printf "$boldred" ;;
+        green)
+                 printf "$green" ;;
+        boldgreen)
+                 printf "$boldgreen" ;;
+        yellow)
+                 printf "$yellow" ;;
+        boldyellow)
+                 printf "$boldyellow" ;;
+        blue)
+                 printf "$blue" ;;
+        boldblue)
+                 printf "$boldblue" ;;
+        magenta)
+                 printf "$magenta" ;;
+        boldmagenta)
+                 printf "$boldmagenta" ;;
+        cyan)
+                 printf "$cyan" ;;
+        boldcyan)
+                 printf "$boldcyan" ;;
+        white)
+                 printf "$white" ;;
+        boldwhite)
+                 printf "$boldwhite" ;;
+esac
+  printf "%s"  "$message"
+  tput sgr0                     # Reset to normal.
+  printf "$black"
+
+return
+}
+
+# Function to run Ansible command with variables to look for in output as parameters
+function runAnsibleCMD() {
+        [[ $debug ]] && echo
+        [[ $debug ]] && cecho "Received command: $@" yellow; echo
+
+        output=`eval ansible $1`
+        retVal=$?
+
+        [[ retVal -eq 1 ]] || [[ retVal -eq 2 ]] || [[ retVal -eq 3 ]] && cecho "Problem with ansible command: ansible $1" red && exit;
+
+        [[ $debug ]] && cecho "$output" cyan
+
+        # Check any output from command
+        [[ -z $output ]] && cecho "no ansible output executing: ansible '$1'" red && exit
+
+        # Determine if output is good enough
+        #num=`echo "$output" | wc -l 2> /dev/null`
+        #[[ $num -le 1 ]] && cecho "output not formatted executing: ansible '$1'" red && exit
+
+        shift
+
+if [[ $@ ]]; then
+        for arg in $@; do
+                while read line
+                        do
+                        case "$line" in
+                        *$arg*)
+                                set -u # Error if expansion is attempted on an unset variable
+                                unset `echo $arg`
+                                value=`echo "-$line" | awk 'BEGIN {FS="\":"}; {printf "%s", $2}' | sed 's/^ *//g' | sed 's/ *$//g' | sed 's/[\"\,]//g'`
+                                name_of_variable=`echo $arg`
+                                eval $name_of_variable='$value'
+                                #[[ $name_of_variable && ${name_of_variable-x} ]] && echo "Found $name_of_variable" || echo "Not found $name_of_variable"
+                                set +o nounset # Reset
+                        ;;
+                        esac
+                done < <(echo $output)
+        done
+fi
+}
+
+function read_c_args()
+{
+    while (($#)) && [[ $1 != -* ]]; do cargs+=("$1"); shift; done
+}
+
+function cleanup() {
+        [[ $tempfile ]] && rm -fv $tempfile
+        [[ $tempfile.bz2 ]] && rm -fv $tempfile.bz2
+        runAnsibleCMD "$slave -u $user -m command -a 'rm $tempfile removes=$tempfile'"
+        runAnsibleCMD "$slave -u $user -m command -a 'rm $tempfile removes=$tempfile.bz2'"
+        exit
+}
+
+function usage()
+{
+        cat <<END
+$0 (C) Copyright 2015 intamixx
+
+Usage: $0 [options]
+
+-u user configured for ansible use
+-l list configured slaves. Used with -g to specify group of hosts
+-g host group name configured in ansible
+ -s <hosts> performs a stop, change master and start on the slave
+  -b forces a copy and re-import of the database from master to the slave
+  -r forces slave reset
+  -m creates replication user on master
+ -c <hosts> checks the slave replication
+ -a checks the slave replication (report style). Used with -g to specify group of hosts
+ -f start slave if not running
+ -x Run tools in dialog mode
+-d debug mode
+
+END
+}
+
+if [[ -z "$1" ]]; then
+        echo "No command line arguments"
+        usage >&2
+        exit 1
+fi
+
+#while (($#)); do
+#    case "$1" in
+#        -c) read_c_args "${@:2}"
+#    esac
+#    shift
+#done
+
+trap 'echo;echo "Exiting $$...";exit' SIGINT SIGTERM EXIT
+
+cecho "--------------------------------------------------------------" boldwhite; echo
+cecho "| Replication Manager | `hostname`            " boldwhite; echo
+cecho "--------------------------------------------------------------" boldwhite; echo
+
+while getopts "u:malfhrxg:c:s:bud" OPT; do
+        case "$OPT" in
+        u)
+                user=$OPTARG
+                ;;
+        l)
+                mode=listslave
+                ;;
+        c)
+                mode=checkslave
+                read_c_args "${@:2}"
+                ;;
+        a)
+                mode=reportslave
+#               read_c_args "${@:2}"
+                ;;
+        s)
+                mode=sync
+                slave=$OPTARG
+                ;;
+        g)
+                group=$OPTARG
+                ;;
+        r)
+                forceslavereset=true
+                ;;
+        b)
+                syncdatabase=true
+                ;;
+        m)
+                createrepluser=true
+                ;;
+        f)
+                mode=startslaves
+                ;;
+        x)
+                mode=dialog
+                ;;
+        d)
+                debug=true
+                ;;
+        h)
+                usage
+                exit 0
+                ;;
+        ?)
+                exit 1
+        esac
+done
+shift $((OPTIND - 1))
+
+        if [ -z "$user" ]; then
+                echo "Please specify a user"
+                exit
+        fi
+
+        if [ -n "$cargs" ] && [ -n "$slave" ]; then
+                echo "Cannot run a checkslave and sync together, please run individually"
+                exit
+        fi
+
+#printf '<%s>' "${cargs[@]}"
+#exit
+
+#echo "The whole list of values is '${multi[@]}'"
+
+#for val in "${multi[@]}"; do
+#    echo " - $val"
+#done
+#exit
+
+# Check running user is root
+#ID=`id | sed 's/uid=\([0-9]*\)(.*/\1/'`
+#if [[ "$ID" != "0" ]] ; then
+#        echo "You must be root to execute the script $0."
+#        exit 1
+#fi
+
+function mainmenu() {
+ 
+### display main menu ###
+cmd=(dialog --clear --backtitle "Replication Manager `hostname`" \
+--title "[ MAIN MENU  - Replication Manager]" \
+--menu "You can use the UP/DOWN arrow keys, the first \n\
+letter of the choice as a hot key, or the \n\
+number keys 1-9 to choose an option.\n\
+Choose the TASK" 22 76 16 \
+"Check Server" "1" \
+"Start Server" "2" \
+"Stop Server" "3" \
+"Check Group Replication" "4" \
+"Start Group Replication" "5" \
+"List Group Hosts" "6" \
+Exit "Exit to the shell")
+
+choices=$("${cmd[@]}" 2>&1 >/dev/tty)
+
+case $choices in
+        *Check\ Server*) check_repl_menu;;
+        *Start\ Server*) start_repl_menu;;
+        *Stop\ Server*) stop_repl_menu;;
+        *Check\ Group\ Replication*) check_group_repl; pause; mainmenu;;
+        *Start\ Group\ Replication*) start_group_repl; pause; mainmenu;;
+        *List\ Group\ Hosts*) msg=${hosts[@]}; display_output 20 40 "Group Hosts" "$msg"; mainmenu;;
+        Exit) echo "Bye"; exit 1;;
+esac
+
+}
+
+function check_repl_menu() {
+ 
+### display check_repl_menu ###
+cmd=(dialog --clear --nocancel --title "[ Check Replication Menu ]" --menu "Select server:" 22 76 16)
+
+choices=$("${cmd[@]}" "${hostsln[@]}" Back "Back to main menu" 2>&1 >/dev/tty)
+
+        for choice in $choices
+        do
+                case $choice in
+                *ns*)
+                        checkslave $choice
+                        sleep 5
+                        check_repl_menu
+                        
+                        ;;
+                Back)
+                        mainmenu
+                        ;;
+                        esac
+        done
+}
+
+function start_repl_menu() {
+ 
+### display start_repl_menu ###
+cmd=(dialog --clear --nocancel --title "[ Start Replication Menu ]" --menu "Select server:" 22 76 16)
+
+choices=$("${cmd[@]}" "${hostsln[@]}" Back "Back to main menu" 2>&1 >/dev/tty)
+
+        for choice in $choices
+        do
+                case $choice in
+                *ns*)
+                        cecho "Starting slave on $choice" green
+                        getslave_mysqllogin $choice
+                        debug=true
+                        runAnsibleCMD "$choice -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=startslave'"
+                        sleep 5
+                        unset debug
+                        start_repl_menu
+                        
+                        ;;
+                Back)
+                        mainmenu
+                        ;;
+                        esac
+        done
+}
+
+function stop_repl_menu() {
+ 
+### display stop_repl_menu ###
+cmd=(dialog --clear --nocancel --title "[ Stop Replication Menu ]" --menu "Select server:" 22 76 16)
+
+choices=$("${cmd[@]}" "${hostsln[@]}" Back "Back to main menu" 2>&1 >/dev/tty)
+
+        for choice in $choices
+        do
+                case $choice in
+                *ns*)
+                        cecho "Stopping slave on $choice" red
+                        getslave_mysqllogin $choice
+                        debug=true
+                        runAnsibleCMD "$choice -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=stopslave'"
+                        sleep 5
+                        unset debug
+                        stop_repl_menu
+                        
+                        ;;
+                Back)
+                        mainmenu
+                        ;;
+                        esac
+        done
+}
+
+function checkslave() {
+                        cecho "* Checking slave $1" yellow
+                        getslave_mysqllogin $1
+                        runAnsibleCMD "$1 -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=getslave'" "Slave_IO_State" "Slave_IO_Running" "Slave_SQL_Running" "Seconds_Behind_Master" "Last_IO_Errno" "Last_IO_Error" "Last_SQL_Errno" "Last_SQL_Error"
+
+
+                        cecho "Slave_IO_State" white; cecho "           $Slave_IO_State" boldwhite; echo
+                        cecho "Slave_IO_Running" white; cecho "         $Slave_IO_Running" boldwhite; echo
+                        cecho "Slave_SQL_Running" white; cecho "        $Slave_SQL_Running" boldwhite; echo
+                        cecho "Seconds_Behind_Master" white; cecho "    $Seconds_Behind_Master" boldwhite; echo
+                        cecho "Last_IO_Errno" white; cecho "            $Last_IO_Errno" boldwhite; echo
+                        cecho "Last_IO_Error" white; cecho "            $Last_IO_Error" boldwhite; echo
+                        cecho "Last_SQL_Errno" white; cecho "           $Last_SQL_Errno" boldwhite; echo
+                        cecho "Last_SQL_Error" white; cecho "           $Last_SQL_Error" boldwhite; echo
+}
+function getslave_mysqllogin() {
+
+                runAnsibleCMD "localhost -u $user -c local -m setup -a 'filter=ansible_local' | grep -i -A 3 $1" "mysqluser" "mysqlpassword" 
+}
+
+function getslaves() {
+                if [[ ! $group ]]; then
+                        usage >&2
+                        exit
+                fi
+                cecho "Slaves configured in Ansible config" boldwhite
+                runAnsibleCMD "-u $user $group --list-hosts"
+
+                hosts=()
+                i=1
+                        while read line
+                                do
+                                case "$line" in
+                                        *)
+                                        cecho  "$line" boldwhite;echo
+                                        line=`echo $line | sed 's/[\ ]//g'`
+                                        hosts=("${hosts[@]}" "$line")
+                                        hostsln=("${hostsln[@]}" "$line")
+                                        hostsln=("${hostsln[@]}" "$i")
+                                        ((i++))
+                                        ;;
+
+                        esac
+                        done < <(echo $output)
+}
+
+function check_group_repl() {
+
+                divider===============================
+                divider=$divider$divider$divider$divider$divider$divider
+                header=" \e[1;44m%-15s\e[m \e[1;44m%-32s\e[m \e[1;44m%-10s\e[m \e[1;44m%-11s\e[m \e[1;44m%-12s\e[m \e[1;44m%-11s\e[m \e[1;44m%-32s\e[m \e[1;44m%-12s\e[m \e[1;44m%-32s\e[m\n"
+                format=" \e[1;32m%-15s\e[m \e[1;1m%-32s %-10s %-11s %-12s %-11s %-32s %-12s %-32s\e[m"
+                width=160
+                printf "%$width.${width}s\n" "$divider"
+                printf "$header" "Server" "SlaveIOState" "SlaveIORun" "SlaveSQLRun" "BehindMaster" "LastIOErrno" "LastIOError" "LastSQLErrno" "LastSQLError"
+                printf "%$width.${width}s" "$divider"
+                for val in "${hosts[@]}"; do
+                        getslave_mysqllogin $val
+                        runAnsibleCMD "$val -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=getslave'" "Slave_IO_State" "Slave_IO_Running" "Slave_SQL_Running" "Seconds_Behind_Master" "Last_IO_Errno" "Last_IO_Error" "Last_SQL_Errno" "Last_SQL_Error"
+                        printf "$format" "${val::15}" ${Slave_IO_State::32} $Slave_IO_Running $Slave_SQL_Running $Seconds_Behind_Master $Last_IO_Errno ${Last_IO_Error::32} $Last_SQL_Errno ${Last_SQL_Error::32}
+                done
+                echo
+}
+
+function start_group_repl() {
+                for val in "${hosts[@]}"; do
+                        cecho "Starting slave on $val" green
+                        unset debug
+                        getslave_mysqllogin $val
+                        debug=true
+                        runAnsibleCMD "$val -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=startslave'"
+                done
+                unset debug
+}
+
+function display_output(){
+        local h=${1-10}                 # box height default 10
+        local w=${2-41}                 # box width default 41
+        local t=${3-Output}             # box title
+        local d=${4}                    # box data
+        dialog --backtitle "Info" --title "${t}" --clear --msgbox ${d} ${h} ${w}
+}
+
+pause(){
+ read -n1 -rsp $'Press any key to continue or Ctrl+C to exit...\n'
+}
+
+# Check if required progs are on system
+        for prog in "${programs[@]}"
+                do
+                        if type "$prog" >/dev/null 2>&1; then echo "Executable $prog found OK"; else echo "Executable $prog missing"; exit 1; fi
+                done
+
+if [[ ! -e $ANSIBLE_CONFIG ]]; then
+        echo "Cannot find file $file. Please configure Ansible hosts first"
+        usage >&2
+        exit 1
+fi
+
+        echo
+
+        case $mode in
+
+        listslave)
+                getslaves
+        ;;
+
+
+        checkslave)
+                for val in "${cargs[@]}"; do
+                        checkslave $val
+                done
+        ;;
+
+        reportslave)
+
+                getslaves
+
+                check_group_repl
+        ;;
+
+
+        dialog)
+                getslaves
+
+                mainmenu
+                ;;
+
+        startslaves)
+                getslaves
+
+                start_group_repl
+                ;;
+
+        sync)
+                echo -e "\e[1mGetting master database position\e[0m"
+                        runAnsibleCMD "localhost -u $user -c local -m mysql_replication -a 'mode=getmaster'" "File" "Position"
+
+                echo -e "\e[2m Master file=$File"
+                echo -e "\e[2m Master position=$Position\e[0m"
+
+                echo -e "\e[1mWorking on slave $slave"
+                echo -e "\e[1mGetting facts for $slave\e[0m"
+                        #runAnsibleCMD "$slave -u $user -m setup -a 'filter=ansible_local'" "master_host" "master_user" "master_password" "master_ssl_ca" "master_ssl_cert" "master_ssl_key" "slave_host"
+                        getslave_mysqllogin $slave
+                        runAnsibleCMD "localhost -u $user -c local -m setup -a 'filter=ansible_local' | grep -i -A 3 $slave" "master_host" "master_user" "master_password" "master_ssl_ca" "master_ssl_cert" "master_ssl_key" "slave_host"
+
+                echo -e "\e[2m Master host=$master_host"
+                echo -e "\e[2m Master user=$master_user"
+                echo -e "\e[2m Master password=$master_password"
+                echo -e "\e[2m Master CA=$master_ssl_ca"
+                echo -e "\e[2m Master SSL cert=$master_ssl_cert"
+                echo -e "\e[2m Master SSL key=$master_ssl_key"
+                echo -e "\e[2m Slave host=$slave_host\e[0m"
+
+                echo -e "\e[1mStopping slave on $slave"
+                        runAnsibleCMD "$slave -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=stopslave'"
+
+                        if [ $syncdatabase ]; then
+                                trap 'echo "Exiting $$...";cleanup ;exit' SIGINT SIGTERM EXIT
+                                # Make the temp file
+                                        tempfile=`mktemp -q /tmp/dump.sql.XXXXX`
+                                        if [[ ! $? == 0 ]]; then
+                                                echo "Creation of temp file failed"
+                                                exit 1
+                                        fi
+
+                                # Dump the local master database
+                                echo -e "\e[1mDumping MDNS database on Master"
+                                runAnsibleCMD "localhost -u $user -c local -m mysql_db -a 'name=mdns state=dump target=$tempfile.bz2'"
+
+                                # Copy the database dump to the slave server
+                                echo -e "\e[1mCopy the database to $slave"
+                                runAnsibleCMD "$slave -u $user -m copy -a 'src=$tempfile.bz2 dest=/tmp'"
+
+                                # Import the database on the slave server
+                                echo -e "\e[1mImport the database on $slave"
+                                runAnsibleCMD "$slave -u $user -m mysql_db -a 'login_user=$mysqluser login_password=$mysqlpassword name=mdns state=import target=$tempfile.bz2'"
+
+                                # Remove the dump file on the slave server
+                                echo -e "\e[1mRemove the dump file on $slave"
+                                runAnsibleCMD "$slave -u $user -m command -a 'rm $tempfile.bz2'"
+                        fi
+
+                        if [ $forceslavereset ];then
+                                echo -e "\e[1mReset slave on $slave"
+                                runAnsibleCMD "$slave -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=resetslave'"
+                        fi
+
+                        if [ $createrepluser ]; then
+                                echo -e "\e[1mAdding Replication User for slave $slave"
+                                # Not using SSL
+                                [[ -z $master_ssl_cert ]] && runAnsibleCMD "localhost -u $user -c local -m mysql_user -a 'name=$master_user host=$slave_host password=$master_password priv=*.*:\"REPLICATION SLAVE, REPLICATION CLIENT\" state=present'"
+
+                                # Using SSL
+                                [[ $master_ssl_cert ]] && runAnsibleCMD "localhost -u $user -c local -m mysql_user -a 'name=$master_user host=$slave_host password=$master_password priv=*.*:\"REPLICATION SLAVE, REPLICATION CLIENT\" require_ssl=true state=present'"
+                        fi
+
+                sleep 1
+
+                echo -e "\e[1mChanging master server on slave"
+                        # Not using SSL
+                        [[ -z $master_ssl_cert ]] && runAnsibleCMD "$slave -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=changemaster master_host=$master_host master_user=$master_user master_password=$master_password master_log_file=$File master_log_pos=$Position'"
+
+                        # Using SSL
+                        [[ $master_ssl_cert ]] && runAnsibleCMD "$slave -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=changemaster master_host=$master_host master_user=$master_user master_password=$master_password master_log_file=$File master_log_pos=$Position master_ssl=1 master_ssl_ca=$master_ssl_ca master_ssl_cert=$master_ssl_cert master_ssl_key=$master_ssl_key'"
+
+                echo -e "\e[1mStarting slave on $slave"
+
+                        runAnsibleCMD "$slave -u $user -m mysql_replication -a 'login_user=$mysqluser login_password=$mysqlpassword mode=startslave'"
+
+                echo -e "\e[32mFinished"
+        ;;
+        esac
